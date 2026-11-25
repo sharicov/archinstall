@@ -21,6 +21,9 @@ sudo pacman -S --needed --noconfirm dialog lua >/dev/null
 command -v yay >/dev/null || { echo "yay not found (install it first)."; exit 1; }
 
 # ══════════════════════════ EDIT YOUR DEFAULTS HERE ══════════════════════════
+# ollama/ollama-rocm 0.40.17-1 on Arch were mismatched (ROCm backend needs libggml-base.so.1) -> CPU fallback.
+# If the backend is broken, this version is installed from the Arch archive and pinned in IgnorePkg.
+OLLAMA_PIN="0.40.14-1"
 MODELS="qwen3.8:27b qwen2.5:14b"   # space-separated tags from ollama.com/library
 
 STEP_LIST='services|Start and enable services|on
@@ -82,6 +85,29 @@ fi
 clear
 
 # ─────────────────────────────── steps ────────────────────────────────────────
+ollama_backend_ok() {
+  local f
+  for f in /usr/lib/ollama/rocm_*/libggml-hip.so; do
+    [[ -e $f ]] || return 1
+    ldd "$f" 2>&1 | grep -q 'not found' && return 1
+  done
+  return 0
+}
+
+ollama_backend_fix() {
+  if ollama_backend_ok; then echo "ollama-rocm backend loads fine ($(pacman -Q ollama-rocm))."; return 0; fi
+  echo "ollama-rocm backend cannot load (missing libggml-base)."
+  local A=https://archive.archlinux.org/packages/o
+  echo "Installing $OLLAMA_PIN from the Arch archive and pinning it..."
+  sudo pacman -U --noconfirm "$A/ollama/ollama-$OLLAMA_PIN-x86_64.pkg.tar.zst" "$A/ollama-rocm/ollama-rocm-$OLLAMA_PIN-x86_64.pkg.tar.zst"
+  if ! grep -qE '^IgnorePkg.*ollama' /etc/pacman.conf; then
+    if grep -q '^IgnorePkg' /etc/pacman.conf; then sudo sed -i -E '/^IgnorePkg/ s/$/ ollama ollama-rocm/' /etc/pacman.conf
+    else sudo sed -i '/^\[options\]/a IgnorePkg = ollama ollama-rocm' /etc/pacman.conf; fi
+  fi
+  ollama_backend_ok || { echo "Backend still broken after pinning."; return 1; }
+  echo "Pinned. Remove 'ollama ollama-rocm' from IgnorePkg once Arch ships a fixed build."
+}
+
 step_services() {
   local u
   for u in "${!SVC[@]}"; do
@@ -96,6 +122,7 @@ step_services() {
 
 step_ollamagpu() {
   id ollama &>/dev/null || { echo "No ollama user: install ollama-rocm first."; exit 1; }
+  ollama_backend_fix
   # the service runs as user "ollama", NOT as you: it needs render+video for /dev/kfd and /dev/dri
   sudo usermod -aG render,video ollama
   sudo mkdir -p /etc/systemd/system/ollama.service.d

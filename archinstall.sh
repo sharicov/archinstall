@@ -2,7 +2,9 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Arch Linux TUI installer (btrfs + zstd + subvolumes, GRUB/UEFI)
 # Run from the Arch live ISO:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/sharicov/archinstall/main/archinstall.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/archinstall.sh)
+# Short form (make an is.gd link with alias "archx" pointing at the raw URL above):
+#   bash <(curl -sL is.gd/archx)
 # Log: /tmp/archinstall.log
 # ──────────────────────────────────────────────────────────────────────────────
 set -u
@@ -17,7 +19,12 @@ command -v dialog >/dev/null || pacman -Sy --noconfirm dialog
 # Format per line:  name|description|on/off
 
 # Part 2 script, copied to the new user's home so you can run it after reboot (leave empty to skip):
-POST_URL="https://raw.githubusercontent.com/sharicov/archinstall/main/archpost.sh"
+POST_URL="https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/archpost.sh"
+
+# Arch's ollama/ollama-rocm 0.40.17-1 were mismatched (backend needs libggml-base.so.1, ollama ships .so.0),
+# so ROCm silently fell back to CPU. If that is detected after install, these versions are installed from
+# the Arch Linux Archive and pinned in IgnorePkg. Unpin when a fixed build lands.
+OLLAMA_PIN="0.40.14-1"
 
 # Always installed by pacstrap (not selectable):
 BASE_PKGS="base linux linux-firmware btrfs-progs grub efibootmgr grub-btrfs inotify-tools pacman-contrib networkmanager vim nano sudo git base-devel openssh"
@@ -89,6 +96,8 @@ gparted|GParted|on
 testdisk|TestDisk|on
 ddrescue|ddrescue|on'
 CAT_PKGS[virt]='ollama-rocm|Ollama (ROCm)|on
+rocm-hip-runtime|ROCm HIP runtime (GPU compute)|on
+rocminfo|ROCm device info (diagnostics)|on
 docker|Docker|on
 docker-compose|Docker Compose|on
 qemu-full|QEMU|on
@@ -117,7 +126,7 @@ sleepmask|Mask sleep/suspend/hibernate targets|on
 fishshell|Use fish as default shell (if fish selected)|on
 greetcfg|Write greetd config (tuigreet + Hyprland)|on
 groups|Add user to render,video,docker,libvirt|on
-ollamachown|chown /var/lib/ollama to ollama user|on'
+ollamachown|Ollama: chown data dir + GPU access (render,video)|on'
 # ═════════════════════════════════════════════════════════════════════════════
 
 declare -A PSEL SSEL OSEL
@@ -294,6 +303,8 @@ run_install() {
   if [[ ${OSEL[multilib]} == on ]]; then
     sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' /mnt/etc/pacman.conf
   fi
+  # no *-debug split packages: they pin exact versions and block later AUR package swaps
+  sed -i -E '/^OPTIONS=/ s/(^|[ (])!?debug/\1!debug/' /mnt/etc/makepkg.conf
   $CH pacman -Syu --noconfirm
 
   echo "==> GRUB"
@@ -322,6 +333,25 @@ run_install() {
     fi
   fi
 
+  if [[ ${PSEL[ollama-rocm]:-off} == on ]]; then
+    echo "==> Checking ollama-rocm backend"
+    if $CH bash -c 'for f in /usr/lib/ollama/rocm_*/libggml-hip.so; do ldd "$f" 2>&1 | grep -q "not found" && exit 1; done; exit 0'; then
+      echo "ollama-rocm backend loads fine."
+    else
+      echo "ollama-rocm backend is broken (missing libggml-base) -> installing $OLLAMA_PIN from the Arch archive"
+      A=https://archive.archlinux.org/packages/o
+      if $CH pacman -U --noconfirm "$A/ollama/ollama-$OLLAMA_PIN-x86_64.pkg.tar.zst" "$A/ollama-rocm/ollama-rocm-$OLLAMA_PIN-x86_64.pkg.tar.zst"; then
+        if grep -q '^IgnorePkg' /mnt/etc/pacman.conf; then
+          sed -i -E '/^IgnorePkg/ s/$/ ollama ollama-rocm/' /mnt/etc/pacman.conf
+        else
+          sed -i '/^\[options\]/a IgnorePkg = ollama ollama-rocm' /mnt/etc/pacman.conf
+        fi
+      else
+        echo "WARNING: could not install the pinned version; Ollama will run on CPU until this is fixed."
+      fi
+    fi
+  fi
+
   echo "==> Post-config"
   if [[ ${OSEL[greetcfg]} == on && ${PSEL[greetd]:-off} == on ]]; then
     local cmd="start-hyprland"; [[ -x /mnt/usr/bin/start-hyprland ]] || cmd="Hyprland"
@@ -342,6 +372,10 @@ EOF
   fi
   if [[ ${OSEL[ollamachown]} == on ]] && grep -q '^ollama:' /mnt/etc/passwd; then
     $CH chown ollama:ollama /var/lib/ollama
+    # the service runs as user "ollama": without render/video it silently falls back to CPU
+    $CH usermod -aG render,video ollama
+    mkdir -p /mnt/etc/systemd/system/ollama.service.d
+    printf '[Service]\nSupplementaryGroups=render video\n' > /mnt/etc/systemd/system/ollama.service.d/gpu.conf
   fi
   if [[ ${OSEL[fishshell]} == on && ${PSEL[fish]:-off} == on ]]; then
     $CH chsh -s /usr/bin/fish "$USERNAME"
@@ -365,6 +399,7 @@ EOF
   rm -f /mnt/etc/sudoers.d/99-installer-tmp
   if [[ -n $POST_URL ]] && curl -fsSL "$POST_URL" -o "/mnt/home/$USERNAME/archpost.sh"; then
     $CH chown "$USERNAME:$USERNAME" "/home/$USERNAME/archpost.sh"
+    $CH chmod +x "/home/$USERNAME/archpost.sh"
     echo "Part 2 saved to ~/archpost.sh"
   fi
   cp "$LOG" /mnt/home/"$USERNAME"/archinstall.log 2>/dev/null || true
