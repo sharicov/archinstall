@@ -3,13 +3,14 @@
 # Arch post-install (part 2). Run AFTER the first reboot, as your normal user,
 # from a terminal INSIDE the Hyprland session (log in via tuigreet first):
 #
-#   curl -fsSL https://raw.githubusercontent.com/sharicov/archinstall/main/archpost.sh -o ~/archpost.sh && bash ~/archpost.sh
+#   curl -fsSL https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/archpost.sh -o ~/archpost.sh && bash ~/archpost.sh
 #
 # Resumable: finished steps are remembered in ~/.local/state/archpost.done.
 # Caelestia needs two passes: run once, log out and back in to the Caelestia
 # shell, then run the same command again to finish the plugin step.
 # ──────────────────────────────────────────────────────────────────────────────
 set -u
+chmod +x "$0" 2>/dev/null || true
 [[ $EUID -ne 0 ]] || { echo "Run as your normal user, not root."; exit 1; }
 STATE=$HOME/.local/state/archpost.done
 mkdir -p "${STATE%/*}"; touch "$STATE"
@@ -20,16 +21,17 @@ sudo pacman -S --needed --noconfirm dialog lua >/dev/null
 command -v yay >/dev/null || { echo "yay not found (install it first)."; exit 1; }
 
 # ══════════════════════════ EDIT YOUR DEFAULTS HERE ══════════════════════════
-MODEL="qwen3.8:27b"   # change to any tag from ollama.com/library
+MODELS="qwen3.8:27b qwen2.5:14b"   # space-separated tags from ollama.com/library
 
 STEP_LIST='services|Start and enable services|on
+ollamagpu|Fix Ollama GPU access (ROCm) + show diagnostics|on
 snapper|Configure snapper for / (+ snap-pac, timers)|on
 caelestia|Caelestia: CLI, hypr-user.lua, caelestia install, hypr link|on
 containers|Docker: Portainer + Open WebUI|on
-ollama|Pull Ollama model|on
+ollama|Pull Ollama models + GPU check|on
 playwright|playwright install firefox|on
 opencode|Install opencode (AI CLI for fixing the OS)|on
-plugins|Caelestia shell plugins (needs 2nd pass inside Caelestia)|on'
+plugins|Caelestia shell plugins (your manual 3 commands; 2nd pass)|on'
 
 SVC_LIST='sshd|SSH server|on
 qemu-guest-agent|QEMU guest agent|on
@@ -72,7 +74,7 @@ if [[ ${STEP[caelestia]} == on ]]; then
   dialog --yesno "Write ~/.config/caelestia/hypr-user.lua (your keyboard layouts, monitors, workspaces)?\n\nAn existing file is backed up." 10 64 >/dev/tty && WRITE_HYPR=1
 fi
 if [[ ${STEP[ollama]} == on ]]; then
-  MODEL=$(dlg --title "Ollama model" --inputbox "Model to pull:" 8 50 "$MODEL") || exit 0
+  MODELS=$(dlg --title "Ollama models" --inputbox "Models to pull (space-separated):" 8 60 "$MODELS") || exit 0
 fi
 if [[ ${STEP[plugins]} == on ]]; then
   dialog --yesno "Plugin step: are you logged into the Caelestia shell session right now?" 7 60 >/dev/tty || STEP[plugins]=off
@@ -90,6 +92,27 @@ step_services() {
       echo "   skip $u (not installed)"
     fi
   done
+}
+
+step_ollamagpu() {
+  id ollama &>/dev/null || { echo "No ollama user: install ollama-rocm first."; exit 1; }
+  # the service runs as user "ollama", NOT as you: it needs render+video for /dev/kfd and /dev/dri
+  sudo usermod -aG render,video ollama
+  sudo mkdir -p /etc/systemd/system/ollama.service.d
+  printf '[Service]\nSupplementaryGroups=render video\n' | sudo tee /etc/systemd/system/ollama.service.d/gpu.conf >/dev/null
+  sudo chown ollama:ollama /var/lib/ollama
+  sudo systemctl daemon-reload
+  sudo systemctl enable ollama
+  sudo systemctl restart ollama
+  sleep 6
+  echo "--- GPU device nodes (need /dev/kfd and /dev/dri/*)"; ls -l /dev/kfd /dev/dri 2>&1 || true
+  echo "--- ROCm agents (6900 XT should show gfx1030)"
+  (rocminfo 2>/dev/null | grep -E 'Marketing Name|gfx' | head -6) || echo "rocminfo: no ROCm agent found"
+  echo "--- Ollama discovery log"
+  journalctl -u ollama -b --no-pager | grep -iE 'rocm|gpu|inference compute|kfd|amdgpu|library' | tail -15 || true
+  echo
+  echo "If /dev/kfd is missing: the GPU is not passed through / amdgpu is not loaded (check lspci -k, dmesg | grep -i amdgpu)."
+  echo "If the log still says no GPU: add  Environment=HSA_OVERRIDE_GFX_VERSION=10.3.0  to the drop-in above."
 }
 
 step_snapper() {
@@ -183,6 +206,7 @@ EOF
     echo "hypr-user.lua syntax OK"
   fi
 
+  sudo pacman -Syu --noconfirm   # keep Qt/quickshell in sync before AUR builds
   caelestia install
 
   local H=$HOME/.config/hypr T=$HOME/.local/state/caelestia/dots/hypr
@@ -209,10 +233,16 @@ step_containers() {
 
 step_ollama() {
   systemctl is-active --quiet ollama || sudo systemctl enable --now ollama
-  local i
+  local i m last=""
   for i in {1..30}; do curl -fs http://127.0.0.1:11434 >/dev/null && break; sleep 1; done
-  ollama pull "$MODEL"
-  ollama ps
+  for m in $MODELS; do ollama pull "$m"; last=$m; done
+  if [[ -n $last ]]; then
+    echo "--- loading $last to check GPU use (PROCESSOR column should say GPU)"
+    ollama run "$last" "Reply with OK" >/dev/null || true
+    ollama ps
+    echo "Note: a ~17 GB model cannot fit fully into 16 GB VRAM, so a GPU/CPU split is normal there."
+    echo "      A 14B model should show 100% GPU."
+  fi
 }
 
 step_playwright() { playwright install firefox; }
@@ -223,7 +253,8 @@ step_opencode() {
 }
 
 step_plugins() {
-  # interactive on purpose: accept removal of conflicting packages when asked
+  # exactly your manual sequence, run interactively (accept removals when asked)
+  sudo snapper -c root create -d "before caelestia plugins" 2>/dev/null || true
   if pacman -Q caelestia-shell-debug &>/dev/null; then sudo pacman -R caelestia-shell-debug; fi
   yay -S caelestia-shell-plugins-git
   caelestia shell -d && caelestia-shell -k
@@ -231,7 +262,7 @@ step_plugins() {
 
 # ─────────────────────────────── run ──────────────────────────────────────────
 declare -a RESULT=()
-for id in services snapper caelestia containers ollama playwright opencode plugins; do
+for id in services ollamagpu snapper caelestia containers ollama playwright opencode plugins; do
   [[ ${STEP[$id]} == on ]] || continue
   echo; echo "════════ $id ════════"
   ( set -eEuo pipefail; "step_$id" ); rc=$?
